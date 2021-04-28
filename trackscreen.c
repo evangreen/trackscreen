@@ -14,6 +14,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#define MAX_FINGERS 10
+
 #define USAGE \
         "Usage: %s /path/to/touchscreen\n\n" \
         "Trackscreen converts an area of your touchscreen into a mouse,\n" \
@@ -25,21 +27,6 @@
         "  -h -- Show this help." \
         "  -v -- Verbose"
 
-#define MAX_FINGERS 2
-#define TAP_TIME_US 100000
-
-typedef struct finger {
-        int prev_x; /* Previous x coordinate */
-        int prev_y; /* Previous y coordinate */
-        int prev_on; /* Previous on value */
-        int x; /* Most recent x coordinate */
-        int y; /* Most recent y coordinate */
-        int on; /* Whether or not the finger is touching or not */
-        int started_in_bounds; /* Whether the touch down started in the box */
-        struct timeval start_time; /* When the finger started touching */
-        struct timeval end_time; /* When the finger lifted off */
-} finger;
-
 typedef struct trackscreen_context {
         int ts; /* Touchscreen file descriptor */
         int tp; /* Trackpad file descriptor */
@@ -47,12 +34,17 @@ typedef struct trackscreen_context {
         int ts_min_y; /* Minimum touchscreen Y coordinate */
         int ts_max_x; /* Maximum touchscreen X coordinate */
         int ts_max_y; /* Maximum touchscreen Y coordinate */
+        int x_res; /* X axis resolution */
+        int y_res; /* Y axis resolution */
         int tp_min_x; /* Minimum trackpad X coordinate */
         int tp_min_y; /* Minimum trackpad Y coordinate */
         int tp_max_x; /* Maximum trackpad X coordinate */
         int tp_max_y; /* Maximum trackpad Y coordinate */
-        int current_slot; /* The most recently selected event finger slot. */
-        finger fingers[MAX_FINGERS]; /* Finger state */
+        int pressure_min; /* Minimum pressure */
+        int pressure_max; /* Maximum pressure */
+        int finger_count; /* Number of slots with a valid tracking ID */
+        int fingers[MAX_FINGERS]; /* Tracking ID of all the fingers down */
+        unsigned int slot; /* currently selected slot */
         double scale; /* touchpad_delta * scale = trackpad_delta */
         int verbose; /* Print stuff! */
 } trackscreen_context;
@@ -62,24 +54,101 @@ typedef struct trackscreen_context {
                 return __LINE__ - 1; \
         }
 
-int setup_trackpad(int fd) {
+static int setup_axis(trackscreen_context *ctx,
+                      int axis_code,
+                      int maximum,
+		      int resolution) {
+
+	struct input_absinfo info = {
+		.value = 0,
+		.minimum = 0,
+		.maximum = maximum,
+		.fuzz = 0,
+		.flat = 0,
+		.resolution = resolution,
+	};
+
+	struct uinput_abs_setup setup = {
+		.code = axis_code,
+		.absinfo = info,
+	};
+
+	CHECK_IOCTL(ctx->tp, UI_SET_ABSBIT, axis_code);
+	CHECK_IOCTL(ctx->tp, UI_ABS_SETUP, &setup);
+        return 0;
+}
+
+static int setup_pressure_axis(trackscreen_context *ctx,
+                               int axis_code,
+                               int minimum,
+                               int maximum) {
+
+	struct input_absinfo info = {
+		.value = 0,
+		.minimum = minimum,
+		.maximum = maximum,
+		.fuzz = 0,
+		.flat = 0,
+		.resolution = 0,
+	};
+	struct uinput_abs_setup setup = {
+		.code = axis_code,
+		.absinfo = info,
+	};
+	CHECK_IOCTL(ctx->tp, UI_SET_ABSBIT, axis_code);
+	CHECK_IOCTL(ctx->tp, UI_ABS_SETUP, &setup);
+        return 0;
+}
+
+static int setup_trackpad(trackscreen_context *ctx) {
+        int fd = ctx->tp;
         struct uinput_setup usetup;
 
         CHECK_IOCTL(fd, UI_SET_EVBIT, EV_KEY);
-        CHECK_IOCTL(fd, UI_SET_KEYBIT, BTN_LEFT);
-        CHECK_IOCTL(fd, UI_SET_KEYBIT, BTN_MIDDLE);
-        CHECK_IOCTL(fd, UI_SET_KEYBIT, BTN_RIGHT);
-        CHECK_IOCTL(fd, UI_SET_KEYBIT, BTN_TOUCH);
         CHECK_IOCTL(fd, UI_SET_KEYBIT, BTN_TOOL_FINGER);
+        CHECK_IOCTL(fd, UI_SET_KEYBIT, BTN_TOUCH);
+        CHECK_IOCTL(fd, UI_SET_KEYBIT, BTN_TOOL_QUINTTAP);
         CHECK_IOCTL(fd, UI_SET_KEYBIT, BTN_TOOL_DOUBLETAP);
         CHECK_IOCTL(fd, UI_SET_KEYBIT, BTN_TOOL_TRIPLETAP);
         CHECK_IOCTL(fd, UI_SET_KEYBIT, BTN_TOOL_QUADTAP);
-        CHECK_IOCTL(fd, UI_SET_EVBIT, EV_REL);
-        CHECK_IOCTL(fd, UI_SET_RELBIT, REL_X);
-        CHECK_IOCTL(fd, UI_SET_RELBIT, REL_Y);
+        CHECK_IOCTL(fd, UI_SET_EVBIT, EV_ABS);
+        CHECK_IOCTL(fd, UI_SET_ABSBIT, ABS_X);
+        CHECK_IOCTL(fd, UI_SET_ABSBIT, ABS_Y);
+        CHECK_IOCTL(fd, UI_SET_ABSBIT, ABS_PRESSURE);
+        CHECK_IOCTL(fd, UI_SET_ABSBIT, ABS_MT_SLOT);
+        CHECK_IOCTL(fd, UI_SET_ABSBIT, ABS_MT_TOUCH_MAJOR);
+        CHECK_IOCTL(fd, UI_SET_ABSBIT, ABS_MT_TOUCH_MINOR);
+        CHECK_IOCTL(fd, UI_SET_ABSBIT, ABS_MT_POSITION_X);
+        CHECK_IOCTL(fd, UI_SET_ABSBIT, ABS_MT_POSITION_Y);
+        CHECK_IOCTL(fd, UI_SET_ABSBIT, ABS_MT_TRACKING_ID);
+        CHECK_IOCTL(fd, UI_SET_ABSBIT, ABS_MT_PRESSURE);
+        CHECK_IOCTL(fd, UI_SET_PROPBIT, INPUT_PROP_POINTER);
+        CHECK_IOCTL(fd, UI_SET_PROPBIT, INPUT_PROP_BUTTONPAD);
+	setup_axis(ctx, ABS_X, ctx->tp_max_x - ctx->tp_min_x, ctx->x_res);
+	setup_axis(ctx, ABS_Y, ctx->tp_max_y - ctx->tp_min_y, ctx->y_res);
+	setup_pressure_axis(ctx,
+                            ABS_PRESSURE,
+                            ctx->pressure_min,
+                            ctx->pressure_max);
 
+	setup_axis(ctx,
+                   ABS_MT_POSITION_X,
+                   ctx->tp_max_x - ctx->tp_min_x,
+                   ctx->x_res);
+
+	setup_axis(ctx,
+                   ABS_MT_POSITION_Y,
+                   ctx->tp_max_y - ctx->tp_min_y,
+                   ctx->y_res);
+
+	setup_pressure_axis(ctx,
+                            ABS_MT_PRESSURE,
+                            ctx->pressure_min,
+                            ctx->pressure_max);
+
+	setup_axis(ctx, ABS_MT_SLOT, 9, 0);
         memset(&usetup, 0, sizeof(usetup));
-        usetup.id.bustype = BUS_USB;
+        usetup.id.bustype = BUS_VIRTUAL;
         usetup.id.vendor = 0x0650; /* sample vendor */
         usetup.id.product = 0x0911; /* sample product */
         strcpy(usetup.name, "Trackscreen");
@@ -89,7 +158,7 @@ int setup_trackpad(int fd) {
         return 0;
 }
 
-int read_touchscreen_parameters(trackscreen_context *ctx) {
+static int read_touchscreen_parameters(trackscreen_context *ctx) {
         struct input_absinfo abs;
 
         if (ioctl(ctx->ts, EVIOCGABS(ABS_X), &abs)) {
@@ -99,6 +168,7 @@ int read_touchscreen_parameters(trackscreen_context *ctx) {
 
         ctx->ts_min_x = abs.minimum;
         ctx->ts_max_x = abs.maximum;
+        ctx->x_res =  abs.resolution;
         if (ioctl(ctx->ts, EVIOCGABS(ABS_Y), &abs)) {
                 perror("Cannot get touchscreen Y info");
                 return -1;
@@ -106,18 +176,29 @@ int read_touchscreen_parameters(trackscreen_context *ctx) {
 
         ctx->ts_min_y = abs.minimum;
         ctx->ts_max_y = abs.maximum;
+        ctx->y_res = abs.resolution;
+        if (ioctl(ctx->ts, EVIOCGABS(ABS_PRESSURE), &abs)) {
+                perror("Cannot get touchscreen X info");
+                return -1;
+        }
+
+        ctx->pressure_min = abs.minimum;
+        ctx->pressure_max = abs.maximum;
         if (ctx->verbose) {
-                printf("Touchscreen X [%d - %d], Y [%d - %d]\n",
+                printf("Touchscreen X [%d - %d], Y [%d - %d], "
+                       "Pressure [%d - %d]\n",
                        ctx->ts_min_x,
                        ctx->ts_max_x,
                        ctx->ts_min_y,
-                       ctx->ts_max_y);
+                       ctx->ts_max_y,
+                       ctx->pressure_min,
+                       ctx->pressure_max);
         }
 
         return 0;
 }
 
-void compute_trackpad_bounds(trackscreen_context *ctx) {
+static void compute_trackpad_bounds(trackscreen_context *ctx) {
         int height;
         int width;
 
@@ -140,20 +221,10 @@ void compute_trackpad_bounds(trackscreen_context *ctx) {
         return;
 }
 
-bool touch_in_box(trackscreen_context *ctx, finger *f) {
-        if ((f->x >= ctx->tp_min_x) && (f->x < ctx->tp_max_x) &&
-            (f->y >= ctx->tp_min_y) && (f->y < ctx->tp_max_y)) {
-
-                    return true;
-        }
-
-        return false;
-}
-
-void emit_mouse_event(trackscreen_context *ctx,
-                      uint16_t type,
-                      uint16_t code,
-                      int32_t value) {
+static void emit_tp_event(trackscreen_context *ctx,
+                          uint16_t type,
+                          uint16_t code,
+                          int32_t value) {
 
         struct input_event ev;
 
@@ -163,161 +234,119 @@ void emit_mouse_event(trackscreen_context *ctx,
         write(ctx->tp, &ev, sizeof(ev));
 }
 
-int process_report(trackscreen_context *ctx) {
-        int click;
-        int64_t delta;
-        double delta_double;
-        int delta_x;
-        int delta_y;
-        finger *f;
-        int i;
+static const uint16_t finger_tap_codes[6] = {
+        0,
+        BTN_TOOL_FINGER,
+        BTN_TOOL_DOUBLETAP,
+        BTN_TOOL_TRIPLETAP,
+        BTN_TOOL_QUADTAP,
+        BTN_TOOL_QUINTTAP
+};
 
-        click = 0;
-        delta_x = 0;
-        delta_y = 0;
-        for (i = 0; i < MAX_FINGERS; i++) {
-                f = &(ctx->fingers[i]);
-                if (f->on != f->prev_on) {
-                        if (!f->on) {
-                                delta = (f->end_time.tv_sec -
-                                         f->start_time.tv_sec) * 1000000;
+static void emit_multitap(trackscreen_context *ctx,
+                          int finger_count,
+                          int32_t value) {
 
-                                delta += f->end_time.tv_usec -
-                                         f->start_time.tv_usec;
+        uint16_t code;
 
-                                if (ctx->verbose) {
-                                        printf("%d Off %ldms\n",
-                                               i,
-                                               delta / 1000);
-                                }
-
-                                if (delta <= TAP_TIME_US) {
-                                        click = 1;
-                                        if (ctx->verbose) {
-                                                printf("Tap%d\n", i);
-                                        }
-                                }
-
-                        } else {
-                                /* Ignore touches that began outside the
-                                   trackpad area. */
-                                f->started_in_bounds = touch_in_box(ctx, f);
-                        }
-                }
-
-                if (f->on && f->prev_on && f->started_in_bounds) {
-                        delta_x += f->x - f->prev_x;
-                        delta_y += f->y - f->prev_y;
-                }
-
-                f->prev_x = f->x;
-                f->prev_y = f->y;
-                f->prev_on = f->on;
+        if ((finger_count <= 0) || (finger_count > 5)) {
+                return;
         }
 
-        if (delta_x) {
-                delta_double = (double)delta_x * ctx->scale;
-                delta_x = (int64_t)delta_double;
-                if (delta_x) {
-                        emit_mouse_event(ctx, EV_REL, REL_X, delta_x);
-                }
+        if (ctx->verbose) {
+                printf("Finger %d: %d\n", finger_count, value);
         }
 
-        if (delta_y) {
-                delta_double = (double)delta_y * ctx->scale;
-                delta_y = (int64_t)delta_double;
-                emit_mouse_event(ctx, EV_REL, REL_Y, delta_y);
-        }
-
-        if (click) {
-                emit_mouse_event(ctx, EV_KEY, BTN_LEFT, 1);
-        }
-
-        if (delta_x | delta_y | click) {
-                emit_mouse_event(ctx, EV_SYN, SYN_REPORT, 0);
-                if (ctx->verbose) {
-                        printf("(%d, %d) %s\n",
-                               delta_x,
-                               delta_y,
-                               click ? "tap" : "");
-                }
-
-                if (click) {
-                        emit_mouse_event(ctx, EV_KEY, BTN_LEFT, 0);
-                        emit_mouse_event(ctx, EV_SYN, SYN_REPORT, 0);
-                }
-        }
-
-        return 0;
+        code = finger_tap_codes[finger_count];
+        emit_tp_event(ctx, EV_KEY, code, value);
+        return;
 }
 
-int convert_event(trackscreen_context *ctx) {
+static int convert_event(trackscreen_context *ctx) {
+        int finger_count;
+        int i;
         struct input_event ev;
-        finger *f;
 
         if (read(ctx->ts, &ev, sizeof(ev)) != sizeof(ev)) {
                 return -1;
         }
 
-        //printf("EV %x %x %x\n", ev.type, ev.code, ev.value);
-        /* Handle a completed report coming in. */
-        if ((ev.type == EV_SYN) && (ev.code == SYN_REPORT)) {
-                return process_report(ctx);
+        if (ctx->verbose) {
+                printf("RECV %x %x %x\n", ev.type, ev.code, ev.value);
         }
 
-        /* Ignore anything but absolute events. */
+        if ((ev.type == EV_SYN) && (ev.code == SYN_REPORT)) {
+                finger_count = 0;
+                for (i = 0; i < MAX_FINGERS; i++) {
+                        if (ctx->fingers[i] > 0) {
+                                finger_count += 1;
+                        }
+                }
+
+                if (finger_count != ctx->finger_count) {
+                        emit_multitap(ctx, ctx->finger_count, 0);
+                        emit_multitap(ctx, finger_count, 1);
+                        ctx->finger_count = finger_count;
+                }
+        }
+
+        /* Send anything but EV_ABS down directly */
         if (ev.type != EV_ABS) {
+                emit_tp_event(ctx, ev.type, ev.code, ev.value);
                 return 0;
         }
 
         switch (ev.code) {
-        case ABS_MT_SLOT:
-                ctx->current_slot = ev.value;
-                break;
-
+        case ABS_X:
         case ABS_MT_POSITION_X:
-                if (ctx->current_slot < MAX_FINGERS) {
-                        ctx->fingers[ctx->current_slot].x = ev.value;
+                if (ev.value < ctx->tp_min_x) {
+                        ev.value = ctx->tp_min_x;
                 }
 
+                if (ev.value >= ctx->tp_max_x) {
+                        ev.value = ctx->tp_max_x - 1;
+                }
+
+                ev.value -= ctx->tp_min_x;
                 break;
 
+        case ABS_Y:
         case ABS_MT_POSITION_Y:
-                if (ctx->current_slot < MAX_FINGERS) {
-                        ctx->fingers[ctx->current_slot].y = ev.value;
+                if (ev.value < ctx->tp_min_y) {
+                        ev.value = ctx->tp_min_y;
                 }
 
+                if (ev.value >= ctx->tp_max_y) {
+                        ev.value = ctx->tp_max_y - 1;
+                }
+
+                ev.value -= ctx->tp_min_y;
+                break;
+
+        case ABS_MT_SLOT:
+                ctx->slot = ev.value;
                 break;
 
         case ABS_MT_TRACKING_ID:
-                if (ctx->current_slot < MAX_FINGERS) {
-                        f = &(ctx->fingers[ctx->current_slot]);
-                        if (ev.value < 0) {
-                                if (f->on > 0) {
-                                        f->end_time = ev.time;
-                                }
-
-                                f->on = 0;
-
-                        } else {
-                                if (f->on == 0) {
-                                        f->start_time = ev.time;
-                                }
-
-                                f->on = ev.value;
-                        }
+                if (ctx->slot < MAX_FINGERS) {
+                        ctx->fingers[ctx->slot] = ev.value;
                 }
 
                 break;
+
+        default:
+                break;
         }
 
+        emit_tp_event(ctx, ev.type, ev.code, ev.value);
         return 0;
 }
 
 int main(int argc, char **argv) {
         int argument_count;
-        char* device_path = NULL;
+        char *device_path = NULL;
         char *end;
+        int finger;
 	int option;
         int status;
         trackscreen_context ctx;
@@ -326,6 +355,10 @@ int main(int argc, char **argv) {
         ctx.ts = -1;
         ctx.tp = -1;
         ctx.scale = 1.0;
+        for (finger = 0; finger < MAX_FINGERS; finger += 1) {
+                ctx.fingers[finger] = -1;
+        }
+
         while (true) {
                 option = getopt(argc, argv, "hs:v");
                 if (option == -1) {
@@ -360,25 +393,6 @@ int main(int argc, char **argv) {
         }
 
         device_path = argv[optind];
-        ctx.tp = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
-        if (ctx.tp < 0) {
-                fprintf(stderr,
-                        "Cannot open %s: %s\n",
-                        device_path,
-                        strerror(errno));
-
-                status = 1;
-                goto mainEnd;
-        }
-
-        status = setup_trackpad(ctx.tp);
-        if (status != 0) {
-                fprintf(stderr,
-                        "Failed trackpad setup, line %d: %s\n",
-                        status,
-                        strerror(errno));
-        }
-
         ctx.ts = open(device_path, O_RDONLY);
         if (ctx.ts < 0) {
                 fprintf(stderr,
@@ -402,6 +416,25 @@ int main(int argc, char **argv) {
         }
 
         compute_trackpad_bounds(&ctx);
+        ctx.tp = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+        if (ctx.tp < 0) {
+                fprintf(stderr,
+                        "Cannot open %s: %s\n",
+                        device_path,
+                        strerror(errno));
+
+                status = 1;
+                goto mainEnd;
+        }
+
+        status = setup_trackpad(&ctx);
+        if (status != 0) {
+                fprintf(stderr,
+                        "Failed trackpad setup, line %d: %s\n",
+                        status,
+                        strerror(errno));
+        }
+
         while (true) {
                 status = convert_event(&ctx);
                 if (status != 0) {
