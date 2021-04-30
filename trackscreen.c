@@ -3,6 +3,7 @@
 #include <linux/input.h>
 #include <linux/hidraw.h>
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -11,6 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -23,7 +25,12 @@
         "the touchscreen, something like /dev/input/XX. Use evtest to\n" \
         "figure out the value of XX that corresponds to your touchscreen.\n" \
         "Options:\n" \
-        "  -s 1.0 -- Set a scaling factor on touchpad movement." \
+        "  -d left,top,width,height -- Define the percentages along the \n" \
+        "     touchpad screen where the virtual trackpad should be \n" \
+        "     active. If not specified, the default is -d 33,67,33,33 \n" \
+        "     for the center bottom tic-tac-toe square.\n" \
+        "  -n -- Connect to the device by name instead of path Try evtest \n" \
+        "     to get a list of names\n." \
         "  -h -- Show this help." \
         "  -v -- Verbose"
 
@@ -36,6 +43,10 @@ typedef struct trackscreen_context {
         int ts_max_y; /* Maximum touchscreen Y coordinate */
         int x_res; /* X axis resolution */
         int y_res; /* Y axis resolution */
+        int tp_left_percent; /* Percent from the left trackpad should start */
+        int tp_top_percent; /* Percent from the top trackpad should start */
+        int tp_width_percent; /* Width of the trackpad as percent of TS. */
+        int tp_height_percent; /* Height of tp as percent of touchscreen. */
         int tp_min_x; /* Minimum trackpad X coordinate */
         int tp_min_y; /* Minimum trackpad Y coordinate */
         int tp_max_x; /* Maximum trackpad X coordinate */
@@ -57,24 +68,24 @@ typedef struct trackscreen_context {
 static int setup_axis(trackscreen_context *ctx,
                       int axis_code,
                       int maximum,
-		      int resolution) {
+                      int resolution) {
 
-	struct input_absinfo info = {
-		.value = 0,
-		.minimum = 0,
-		.maximum = maximum,
-		.fuzz = 0,
-		.flat = 0,
-		.resolution = resolution,
-	};
+        struct input_absinfo info = {
+                .value = 0,
+                .minimum = 0,
+                .maximum = maximum,
+                .fuzz = 0,
+                .flat = 0,
+                .resolution = resolution,
+        };
 
-	struct uinput_abs_setup setup = {
-		.code = axis_code,
-		.absinfo = info,
-	};
+        struct uinput_abs_setup setup = {
+                .code = axis_code,
+                .absinfo = info,
+        };
 
-	CHECK_IOCTL(ctx->tp, UI_SET_ABSBIT, axis_code);
-	CHECK_IOCTL(ctx->tp, UI_ABS_SETUP, &setup);
+        CHECK_IOCTL(ctx->tp, UI_SET_ABSBIT, axis_code);
+        CHECK_IOCTL(ctx->tp, UI_ABS_SETUP, &setup);
         return 0;
 }
 
@@ -83,20 +94,20 @@ static int setup_pressure_axis(trackscreen_context *ctx,
                                int minimum,
                                int maximum) {
 
-	struct input_absinfo info = {
-		.value = 0,
-		.minimum = minimum,
-		.maximum = maximum,
-		.fuzz = 0,
-		.flat = 0,
-		.resolution = 0,
-	};
-	struct uinput_abs_setup setup = {
-		.code = axis_code,
-		.absinfo = info,
-	};
-	CHECK_IOCTL(ctx->tp, UI_SET_ABSBIT, axis_code);
-	CHECK_IOCTL(ctx->tp, UI_ABS_SETUP, &setup);
+        struct input_absinfo info = {
+                .value = 0,
+                .minimum = minimum,
+                .maximum = maximum,
+                .fuzz = 0,
+                .flat = 0,
+                .resolution = 0,
+        };
+        struct uinput_abs_setup setup = {
+                .code = axis_code,
+                .absinfo = info,
+        };
+        CHECK_IOCTL(ctx->tp, UI_SET_ABSBIT, axis_code);
+        CHECK_IOCTL(ctx->tp, UI_ABS_SETUP, &setup);
         return 0;
 }
 
@@ -124,29 +135,29 @@ static int setup_trackpad(trackscreen_context *ctx) {
         CHECK_IOCTL(fd, UI_SET_ABSBIT, ABS_MT_PRESSURE);
         CHECK_IOCTL(fd, UI_SET_PROPBIT, INPUT_PROP_POINTER);
         CHECK_IOCTL(fd, UI_SET_PROPBIT, INPUT_PROP_BUTTONPAD);
-	setup_axis(ctx, ABS_X, ctx->tp_max_x - ctx->tp_min_x, ctx->x_res);
-	setup_axis(ctx, ABS_Y, ctx->tp_max_y - ctx->tp_min_y, ctx->y_res);
-	setup_pressure_axis(ctx,
+        setup_axis(ctx, ABS_X, ctx->tp_max_x - ctx->tp_min_x, ctx->x_res);
+        setup_axis(ctx, ABS_Y, ctx->tp_max_y - ctx->tp_min_y, ctx->y_res);
+        setup_pressure_axis(ctx,
                             ABS_PRESSURE,
                             ctx->pressure_min,
                             ctx->pressure_max);
 
-	setup_axis(ctx,
+        setup_axis(ctx,
                    ABS_MT_POSITION_X,
                    ctx->tp_max_x - ctx->tp_min_x,
                    ctx->x_res);
 
-	setup_axis(ctx,
+        setup_axis(ctx,
                    ABS_MT_POSITION_Y,
                    ctx->tp_max_y - ctx->tp_min_y,
                    ctx->y_res);
 
-	setup_pressure_axis(ctx,
+        setup_pressure_axis(ctx,
                             ABS_MT_PRESSURE,
                             ctx->pressure_min,
                             ctx->pressure_max);
 
-	setup_axis(ctx, ABS_MT_SLOT, 9, 0);
+        setup_axis(ctx, ABS_MT_SLOT, 9, 0);
         memset(&usetup, 0, sizeof(usetup));
         usetup.id.bustype = BUS_VIRTUAL;
         usetup.id.vendor = 0x0650; /* sample vendor */
@@ -206,10 +217,12 @@ static void compute_trackpad_bounds(trackscreen_context *ctx) {
         width = ctx->ts_max_x - ctx->ts_min_x;
 
         /* In a 3x3 grid, put the trackpad in the bottom middle. */
-        ctx->tp_min_x = ctx->ts_min_x + (width / 3);
-        ctx->tp_max_x = ctx->tp_min_x + (width / 3);
-        ctx->tp_min_y = ctx->ts_min_y + (height * 2 / 3);
-        ctx->tp_max_y = ctx->ts_max_y;
+        ctx->tp_min_x = ctx->ts_min_x + (width * ctx->tp_left_percent / 100);
+        ctx->tp_max_x = ctx->tp_min_x + (width * ctx->tp_width_percent / 100);
+        ctx->tp_min_y = ctx->ts_min_y + (height * ctx->tp_top_percent / 100);
+        ctx->tp_max_y = ctx->tp_min_y +
+                        (height * ctx->tp_height_percent / 100);
+
         if (ctx->verbose) {
                 printf("Trackpad X [%d - %d], Y [%d - %d]\n",
                        ctx->tp_min_x,
@@ -342,30 +355,221 @@ static int convert_event(trackscreen_context *ctx) {
         return 0;
 }
 
+static int read_trackpad_dimensions(trackscreen_context *ctx,
+                                    char *arg) {
+
+        int items;
+
+        items = sscanf(arg,
+                       "%d,%d,%d,%d",
+                       &(ctx->tp_left_percent),
+                       &(ctx->tp_top_percent),
+                       &(ctx->tp_width_percent),
+                       &(ctx->tp_height_percent));
+
+        if (items != 4) {
+                fprintf(stderr, "Scanned only %d items\n", items);
+                return -1;
+        }
+
+        if ((ctx->tp_left_percent < 0) || (ctx->tp_left_percent >= 100) ||
+            (ctx->tp_top_percent < 0) || (ctx->tp_top_percent >= 100)) {
+
+                fprintf(stderr, "Top/left percents must be between 0-100.\n");
+                return -1;
+        }
+
+        if ((ctx->tp_width_percent <= 0) || (ctx->tp_width_percent > 100) ||
+            (ctx->tp_left_percent + ctx->tp_width_percent > 100) ||
+            (ctx->tp_height_percent <= 0) || (ctx->tp_height_percent > 100) ||
+            (ctx->tp_top_percent + ctx->tp_height_percent > 100)) {
+
+                fprintf(stderr,
+                        "Width/height must be between 1-100, and must not "
+                        "add to >100 when offset by left/top.");
+
+                return -1;
+        }
+
+        return 0;
+}
+
+static int has_abs_bit(int fd, int absbit) {
+        unsigned char absbits[(ABS_MAX / 8) + 1];
+        int rc;
+
+        memset(absbits, 0, sizeof(absbits));
+        rc = ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits);
+        if (rc < 0) {
+                return 0;
+        }
+
+        if ((absbits[absbit / 8] & (1 << (absbit % 8))) != 0) {
+                return 1;
+        }
+
+        return 0;
+}
+static int find_input_by_name(trackscreen_context *ctx,
+                              const char *arg) {
+
+        char devicename[256];
+        DIR *dir;
+        struct dirent *entry;
+        unsigned long evbit;
+        int fd;
+        char fullpath[268];
+        int rc;
+
+        dir = opendir("/dev/input");
+        if (dir == NULL) {
+                perror("Cannot open /dev/input");
+                return -1;
+        }
+
+        fd = -1;
+        while (1) {
+                entry = readdir(dir);
+                if (entry == NULL) {
+                        break;
+                }
+
+                if (strncmp(entry->d_name, "event", 5) != 0) {
+                        if (ctx->verbose) {
+                                printf("Skipping %s\n", entry->d_name);
+                        }
+
+                        continue;
+                }
+
+                snprintf(fullpath,
+                         sizeof(fullpath),
+                         "/dev/input/%s",
+                         entry->d_name);
+
+                fullpath[sizeof(fullpath) - 1] = '\0';
+                fd = open(fullpath, O_RDONLY);
+                if (fd < 0) {
+                        if (ctx->verbose) {
+                                fprintf(stderr,
+                                        "Cannot open %s: %s\n",
+                                        fullpath,
+                                        strerror(errno));
+                        }
+
+                        continue;
+                }
+
+                rc = ioctl(fd, EVIOCGNAME(sizeof(devicename)), devicename);
+                if (rc < 0) {
+                        if (ctx->verbose) {
+                                fprintf(stderr,
+                                        "Could not get name for %s: %s\n",
+                                        fullpath,
+                                        strerror(errno));
+                        }
+
+                        close(fd);
+                        continue;
+                }
+
+                if (strcmp(devicename, arg) != 0) {
+                        if (ctx->verbose) {
+                                fprintf(stderr,
+                                        "Skip '%s' != '%s'\n",
+                                        devicename,
+                                        arg);
+                        }
+
+                        close(fd);
+                        continue;
+                }
+
+                /* See if it has EV_ABS */
+                evbit = 0;
+                ioctl(fd, EVIOCGBIT(0, sizeof(evbit)), &evbit);
+                if ((evbit & (1 << EV_ABS)) == 0) {
+                        if (ctx->verbose) {
+                                fprintf(stderr,
+                                        "Skip %s, missing EV_ABS\n",
+                                        fullpath);
+                        }
+
+                        close(fd);
+                        continue;
+                }
+
+                /* See if it has ABS_MT_POSITION_Y */
+                if (!has_abs_bit(fd, ABS_MT_POSITION_Y)) {
+                        if (ctx->verbose) {
+                                fprintf(stderr,
+                                        "Skip %s, missing ABS_MT_POSITION_Y\n",
+                                        fullpath);
+                        }
+
+                        close(fd);
+                        continue;
+                }
+
+                if (ctx->verbose) {
+                        printf("Found %s matching '%s'\n", fullpath, arg);
+                }
+
+                goto end;
+        }
+
+        errno = ENOENT;
+        fd = -1;
+
+end:
+        closedir(dir);
+        return fd;
+}
+
 int main(int argc, char **argv) {
         int argument_count;
+        trackscreen_context ctx;
         char *device_path = NULL;
         char *end;
         int finger;
-	int option;
+        int option;
         int status;
-        trackscreen_context ctx;
+        int use_name;
 
+        use_name = 0;
         memset(&ctx, 0, sizeof(ctx));
         ctx.ts = -1;
         ctx.tp = -1;
         ctx.scale = 1.0;
+        /* Put trackpad in the bottom center tic-tac-toe square. */
+        ctx.tp_left_percent = 33;
+        ctx.tp_top_percent = 67;
+        ctx.tp_width_percent = 33;
+        ctx.tp_height_percent = 33;
         for (finger = 0; finger < MAX_FINGERS; finger += 1) {
                 ctx.fingers[finger] = -1;
         }
 
         while (true) {
-                option = getopt(argc, argv, "hs:v");
+                option = getopt(argc, argv, "d:hns:v");
                 if (option == -1) {
                         break;
                 }
 
-		switch (option) {
+                switch (option) {
+                case 'd':
+                        status = read_trackpad_dimensions(&ctx, optarg);
+                        if (status != 0) {
+                                fprintf(stderr, "Invalid dimensions\n");
+                                return 1;
+                        }
+
+                        break;
+
+                case 'n':
+                        use_name = 1;
+                        break;
+
                 case 's':
                         ctx.scale = strtod(optarg, &end);
                         if ((end == optarg) || (*end != '\0')) {
@@ -375,25 +579,31 @@ int main(int argc, char **argv) {
 
                         break;
 
-		case 'v':
-			ctx.verbose = true;
-			break;
+                case 'v':
+                        ctx.verbose = true;
+                        break;
 
                 case 'h':
-		default:
-			printf(USAGE, argv[0]);
+                default:
+                        printf(USAGE, argv[0]);
                         return 1;
-		}
-	}
+                }
+        }
 
-	argument_count = argc - optind;
-	if (argument_count != 1) {
-		fprintf(stderr, "Expecting 1 argument. See -h for usage.\n");
+        argument_count = argc - optind;
+        if (argument_count != 1) {
+                fprintf(stderr, "Expecting 1 argument. See -h for usage.\n");
                 return 1;
         }
 
         device_path = argv[optind];
-        ctx.ts = open(device_path, O_RDONLY);
+        if (use_name != 0) {
+                ctx.ts = find_input_by_name(&ctx, device_path);
+
+        } else {
+                ctx.ts = open(device_path, O_RDONLY);
+        }
+
         if (ctx.ts < 0) {
                 fprintf(stderr,
                         "Cannot open %s: %s\n",
@@ -453,5 +663,5 @@ mainEnd:
                 close(ctx.tp);
         }
 
-	return status;
+        return status;
 }
