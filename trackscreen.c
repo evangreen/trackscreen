@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #define MAX_FINGERS 10
+#define MAX_EVENTS_PER_REPORT 24
 
 #define USAGE \
         "Usage: %s /path/to/touchscreen\n\n" \
@@ -29,6 +30,9 @@
         "     touchpad screen where the virtual trackpad should be \n" \
         "     active. If not specified, the default is -d 33,67,33,33 \n" \
         "     for the center bottom tic-tac-toe square.\n" \
+        "  -k keycode -- Create a fake keyboard and send keyboard events \n" \
+        "     whenever there are touches to the side of the trackpad.\n" \
+        "     See input-event-codes.h for KEY_* definitions." \
         "  -n -- Connect to the device by name instead of path Try evtest \n" \
         "     to get a list of names\n." \
         "  -h -- Show this help." \
@@ -37,6 +41,8 @@
 typedef struct trackscreen_context {
         int ts; /* Touchscreen file descriptor */
         int tp; /* Trackpad file descriptor */
+        int kbd; /* Fake keyboard file descriptor */
+        int keycode; /* Keyboard keycode for side palm touches. */
         int ts_min_x; /* Minimum touchscreen X coordinate */
         int ts_min_y; /* Minimum touchscreen Y coordinate */
         int ts_max_x; /* Maximum touchscreen X coordinate */
@@ -58,6 +64,11 @@ typedef struct trackscreen_context {
         unsigned int slot; /* currently selected slot */
         double scale; /* touchpad_delta * scale = trackpad_delta */
         int verbose; /* Print stuff! */
+        struct input_event input_event[MAX_EVENTS_PER_REPORT]; /* Events this report */
+        int input_events; /* Valid events in this report */
+        int pos_x; /* X position from last report */
+        int pos_y; /* Y position from last report */
+        unsigned int sidekey; /* Current sidekey state. */
 } trackscreen_context;
 
 #define CHECK_IOCTL(args...) \
@@ -112,8 +123,15 @@ static int setup_pressure_axis(trackscreen_context *ctx,
 }
 
 static int setup_trackpad(trackscreen_context *ctx) {
-        int fd = ctx->tp;
+        int fd;
         struct uinput_setup usetup;
+
+        ctx->tp = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+        fd = ctx->tp;
+        if (fd < 0) {
+                perror("Cannot open /dev/uinput");
+                return __LINE__;
+        }
 
         CHECK_IOCTL(fd, UI_SET_EVBIT, EV_KEY);
         CHECK_IOCTL(fd, UI_SET_KEYBIT, BTN_TOOL_FINGER);
@@ -163,7 +181,29 @@ static int setup_trackpad(trackscreen_context *ctx) {
         usetup.id.vendor = 0x0650; /* sample vendor */
         usetup.id.product = 0x0911; /* sample product */
         strcpy(usetup.name, "Trackscreen");
+        CHECK_IOCTL(fd, UI_DEV_SETUP, &usetup);
+        CHECK_IOCTL(fd, UI_DEV_CREATE);
+        return 0;
+}
 
+static int setup_keyboard(trackscreen_context *ctx) {
+        int fd;
+        struct uinput_setup usetup;
+
+        ctx->kbd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+        fd = ctx->kbd;
+        if (fd < 0) {
+                perror("Cannot open /dev/uinput");
+                return __LINE__;
+        }
+
+        CHECK_IOCTL(fd, UI_SET_EVBIT, EV_KEY);
+        CHECK_IOCTL(fd, UI_SET_KEYBIT, ctx->keycode);
+        memset(&usetup, 0, sizeof(usetup));
+        usetup.id.bustype = BUS_VIRTUAL;
+        usetup.id.vendor = 0x0650; /* sample vendor */
+        usetup.id.product = 0x0912; /* sample product */
+        strcpy(usetup.name, "Trackscreen Keyboard");
         CHECK_IOCTL(fd, UI_DEV_SETUP, &usetup);
         CHECK_IOCTL(fd, UI_DEV_CREATE);
         return 0;
@@ -234,17 +274,157 @@ static void compute_trackpad_bounds(trackscreen_context *ctx) {
         return;
 }
 
-static void emit_tp_event(trackscreen_context *ctx,
-                          uint16_t type,
-                          uint16_t code,
-                          int32_t value) {
+static void queue_tp_event(trackscreen_context *ctx,
+                           uint16_t type,
+                           uint16_t code,
+                           int32_t value) {
 
-        struct input_event ev;
+        struct input_event *ev;
 
-        ev.type = type;
-        ev.code = code;
-        ev.value = value;
-        write(ctx->tp, &ev, sizeof(ev));
+        if (ctx->input_events >= MAX_EVENTS_PER_REPORT) {
+                if (ctx->verbose) {
+                        fprintf(stderr, "Lost event\n");
+                }
+
+                return;
+        }
+
+        ev = &(ctx->input_event[ctx->input_events]);
+        ctx->input_events += 1;
+        ev->type = type;
+        ev->code = code;
+        ev->value = value;
+        return;
+}
+
+static void flush_tp_events(trackscreen_context *ctx,
+                            struct input_event *report) {
+
+        size_t size;
+
+        size = ctx->input_events * sizeof(struct input_event);
+        write(ctx->tp, &(ctx->input_event[0]), size);
+        ctx->input_events = 0;
+        write(ctx->tp, report, sizeof(*report));
+        return;
+}
+
+static void emit_sidekey_event(trackscreen_context *ctx,
+                               int32_t value) {
+
+        struct input_event ev[2];
+
+        ev[0].type = EV_KEY;
+        ev[0].code = ctx->keycode;
+        ev[0].value = value;
+        ev[1].type = EV_SYN;
+        ev[1].code = SYN_REPORT;
+        ev[1].value = 0;
+        write(ctx->kbd, ev, sizeof(ev));
+        return;
+}
+
+static void check_bounds(trackscreen_context *ctx) {
+        struct input_event *ev;
+        int index;
+        int side_touches;
+        int x;
+        int y;
+
+        x = ctx->pos_x;
+        y = ctx->pos_y;
+
+        /*
+         * Go through all the events in this report and pick out the X
+         * and Y position if possible. Assume that ABS_* and ABS_MT_POSITION_*
+         * will be the same.
+         */
+        ev = &(ctx->input_event[0]);
+        for (index = 0; index < ctx->input_events; index += 1) {
+                if (ev->type == EV_ABS) {
+                        if ((ev->code == ABS_X) ||
+                            (ev->code == ABS_MT_POSITION_X)) {
+
+                                x = ev->value;
+
+                        } else if ((ev->code == ABS_Y) ||
+                                   (ev->code == ABS_MT_POSITION_Y)) {
+
+                                y = ev->value;
+                        }
+                }
+
+                ev += 1;
+        }
+
+        /* If X or Y cannot be found, do nothing. */
+        if ((x == -1) || (y == -1)) {
+                if (ctx->verbose) {
+                        printf("Full point not found: %d %d\n", x, y);
+                }
+
+                return;
+        }
+
+        /* Figure out if there are touches on either side of the trackpad. */
+        side_touches = 0;
+        if ((y >= ctx->tp_min_y) && (y < ctx->tp_max_y)) {
+                if ((x < ctx->tp_min_x) || (x >= ctx->tp_max_x)) {
+                        side_touches = 1;
+                }
+        }
+
+        if (side_touches != ctx->sidekey) {
+                ctx->sidekey = side_touches;
+                if (ctx->verbose) {
+                        printf("Sidekey: %d\n", side_touches);
+                }
+
+                if (ctx->kbd > 0) {
+                        emit_sidekey_event(ctx, side_touches);
+                }
+        }
+
+        ctx->pos_x = x;
+        ctx->pos_y = y;
+        /* Clamp and adjust x and y. */
+        if (x < ctx->tp_min_x) {
+                x = ctx->tp_min_x;
+
+        } else if (x >= ctx->tp_max_x) {
+                x = ctx->tp_max_x - 1;
+        }
+
+        if (y < ctx->tp_min_y) {
+                y = ctx->tp_min_y;
+
+        } else if (y >= ctx->tp_max_y) {
+                y = ctx->tp_max_y - 1;
+        }
+
+        x -= ctx->tp_min_x;
+        y -= ctx->tp_min_y;
+
+        /* Replace the positions */
+        ev = &(ctx->input_event[0]);
+        for (index = 0; index < ctx->input_events; index += 1) {
+                if (ev->type == EV_ABS) {
+                        if ((ev->code == ABS_X) ||
+                            (ev->code == ABS_MT_POSITION_X)) {
+
+                                ev->value = x;
+
+                        } else if ((ev->code == ABS_Y) ||
+                                   (ev->code == ABS_MT_POSITION_Y)) {
+
+                                ev->value = y;
+                        }
+                }
+
+                ev += 1;
+        }
+
+        return;
 }
 
 static const uint16_t finger_tap_codes[6] = {
@@ -271,11 +451,11 @@ static void emit_multitap(trackscreen_context *ctx,
         }
 
         code = finger_tap_codes[finger_count];
-        emit_tp_event(ctx, EV_KEY, code, value);
+        queue_tp_event(ctx, EV_KEY, code, value);
         return;
 }
 
-static int convert_event(trackscreen_context *ctx) {
+static int handle_event(trackscreen_context *ctx) {
         int finger_count;
         int i;
         struct input_event ev;
@@ -301,41 +481,31 @@ static int convert_event(trackscreen_context *ctx) {
                         emit_multitap(ctx, finger_count, 1);
                         ctx->finger_count = finger_count;
                 }
+
+                check_bounds(ctx);
+
+                /*
+                 * If there are no more fingers down, release the
+                 * sidekey key as well.
+                 */
+                if ((finger_count == 0) && (ctx->sidekey != 0)) {
+                        ctx->sidekey = 0;
+                        if (ctx->keycode > 0) {
+                                emit_sidekey_event(ctx, 0);
+                        }
+                }
+
+                flush_tp_events(ctx, &ev);
+                return 0;
         }
 
         /* Send anything but EV_ABS down directly */
         if (ev.type != EV_ABS) {
-                emit_tp_event(ctx, ev.type, ev.code, ev.value);
+                queue_tp_event(ctx, ev.type, ev.code, ev.value);
                 return 0;
         }
 
         switch (ev.code) {
-        case ABS_X:
-        case ABS_MT_POSITION_X:
-                if (ev.value < ctx->tp_min_x) {
-                        ev.value = ctx->tp_min_x;
-                }
-
-                if (ev.value >= ctx->tp_max_x) {
-                        ev.value = ctx->tp_max_x - 1;
-                }
-
-                ev.value -= ctx->tp_min_x;
-                break;
-
-        case ABS_Y:
-        case ABS_MT_POSITION_Y:
-                if (ev.value < ctx->tp_min_y) {
-                        ev.value = ctx->tp_min_y;
-                }
-
-                if (ev.value >= ctx->tp_max_y) {
-                        ev.value = ctx->tp_max_y - 1;
-                }
-
-                ev.value -= ctx->tp_min_y;
-                break;
-
         case ABS_MT_SLOT:
                 ctx->slot = ev.value;
                 break;
@@ -351,7 +521,7 @@ static int convert_event(trackscreen_context *ctx) {
                 break;
         }
 
-        emit_tp_event(ctx, ev.type, ev.code, ev.value);
+        queue_tp_event(ctx, ev.type, ev.code, ev.value);
         return 0;
 }
 
@@ -410,6 +580,7 @@ static int has_abs_bit(int fd, int absbit) {
 
         return 0;
 }
+
 static int find_input_by_name(trackscreen_context *ctx,
                               const char *arg) {
 
@@ -540,6 +711,8 @@ int main(int argc, char **argv) {
         memset(&ctx, 0, sizeof(ctx));
         ctx.ts = -1;
         ctx.tp = -1;
+        ctx.kbd = -1;
+        ctx.keycode = -1;
         ctx.scale = 1.0;
         /* Put trackpad in the bottom center tic-tac-toe square. */
         ctx.tp_left_percent = 33;
@@ -551,7 +724,7 @@ int main(int argc, char **argv) {
         }
 
         while (true) {
-                option = getopt(argc, argv, "d:hns:v");
+                option = getopt(argc, argv, "d:hk:ns:v");
                 if (option == -1) {
                         break;
                 }
@@ -561,6 +734,15 @@ int main(int argc, char **argv) {
                         status = read_trackpad_dimensions(&ctx, optarg);
                         if (status != 0) {
                                 fprintf(stderr, "Invalid dimensions\n");
+                                return 1;
+                        }
+
+                        break;
+
+                case 'k':
+                        ctx.keycode = atoi(optarg);
+                        if (ctx.keycode <= 0) {
+                                fprintf(stderr, "Invalid keycode\n");
                                 return 1;
                         }
 
@@ -626,27 +808,29 @@ int main(int argc, char **argv) {
         }
 
         compute_trackpad_bounds(&ctx);
-        ctx.tp = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
-        if (ctx.tp < 0) {
-                fprintf(stderr,
-                        "Cannot open %s: %s\n",
-                        device_path,
-                        strerror(errno));
-
-                status = 1;
-                goto mainEnd;
-        }
-
         status = setup_trackpad(&ctx);
         if (status != 0) {
                 fprintf(stderr,
                         "Failed trackpad setup, line %d: %s\n",
                         status,
                         strerror(errno));
+
+                goto mainEnd;
         }
 
+        if (ctx.keycode > 0) {
+                status = setup_keyboard(&ctx);
+                if (status != 0) {
+                        fprintf(stderr,
+                                "Failed keyboard setup, line %d: %s\n",
+                                status,
+                                strerror(errno));
+
+                        goto mainEnd;
+                }
+        }
         while (true) {
-                status = convert_event(&ctx);
+                status = handle_event(&ctx);
                 if (status != 0) {
                         goto mainEnd;
                 }
@@ -661,6 +845,10 @@ mainEnd:
 
         if (ctx.tp >= 0) {
                 close(ctx.tp);
+        }
+
+        if (ctx.kbd >= 0) {
+                close(ctx.kbd);
         }
 
         return status;

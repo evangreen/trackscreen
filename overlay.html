@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en" class="no-js">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width">
+
+  <title>Trackpad Area</title>
+
+  <meta name="theme-color" content="#FF00FF">
+</head>
+
+<body>
+  <style>
+    .sticky-image-wrapper{
+        position: fixed;
+        bottom: 0;
+        width: 100%;
+    }
+
+    .sticky-image-wrapper img{
+        display: table;
+        position: relative;
+        margin: auto;
+   }
+  </style>
+  <script>
+document.addEventListener('keydown', (event) => {
+        if (event.key == 'ZenkakuHankaku') {
+                document.getElementById("leftimg").style.visibility = "hidden";
+                document.getElementById("rightimg").style.visibility = "hidden";
+        }
+});
+document.addEventListener('keyup', (event) => {
+        if (event.key == 'ZenkakuHankaku') {
+                document.getElementById("leftimg").style.visibility = "visible";
+                document.getElementById("rightimg").style.visibility = "visible";
+        }
+});
+  </script>
+  <div class="sticky-image-wrapper">
+    <img src="http://placekitten.com/350/200" style="float: left;" id="leftimg">
+    <img src="http://placekitten.com/350/200" style="float: right;" id="rightimg">
+  </div>
+</body>
+</html>
