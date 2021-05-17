@@ -3,7 +3,7 @@ DATE ::= $(shell date --iso-8601=seconds)
 GIT_INFO := $(shell git describe --abbrev=7 --dirty --always --tags)
 
 CPPFLAGS := -DBUILD_GIT_INFO=\"$(GIT_INFO)\" -DBUILD_DATE=\"$(DATE)\"
-CFLAGS := -Wall -O2
+CFLAGS := -Wall -O2 -Wno-unused-result
 CC = gcc
 
 all: bin/trackscreen

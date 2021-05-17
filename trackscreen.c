@@ -32,11 +32,11 @@
         "     for the center bottom tic-tac-toe square.\n" \
         "  -k keycode -- Create a fake keyboard and send keyboard events \n" \
         "     whenever there are touches to the side of the trackpad.\n" \
-        "     See input-event-codes.h for KEY_* definitions." \
+        "     See input-event-codes.h for KEY_* definitions.\n" \
         "  -n -- Connect to the device by name instead of path Try evtest \n" \
         "     to get a list of names\n." \
-        "  -h -- Show this help." \
-        "  -v -- Verbose"
+        "  -h -- Show this help.\n" \
+        "  -v -- Verbose\n"
 
 typedef struct trackscreen_context {
         int ts; /* Touchscreen file descriptor */
@@ -219,7 +219,7 @@ static int read_touchscreen_parameters(trackscreen_context *ctx) {
 
         ctx->ts_min_x = abs.minimum;
         ctx->ts_max_x = abs.maximum;
-        ctx->x_res =  abs.resolution;
+        ctx->x_res = abs.resolution;
         if (ioctl(ctx->ts, EVIOCGABS(ABS_Y), &abs)) {
                 perror("Cannot get touchscreen Y info");
                 return -1;
@@ -368,10 +368,8 @@ static void check_bounds(trackscreen_context *ctx) {
 
         /* Figure out if there are touches on either side of the trackpad. */
         side_touches = 0;
-        if ((y >= ctx->tp_min_y) && (y < ctx->tp_max_y)) {
-                if ((x < ctx->tp_min_x) || (x >= ctx->tp_max_x)) {
-                        side_touches = 1;
-                }
+        if ((x < ctx->tp_min_x) || (x >= ctx->tp_max_x)) {
+                side_touches = 1;
         }
 
         if (side_touches != ctx->sidekey) {
@@ -465,7 +463,7 @@ static int handle_event(trackscreen_context *ctx) {
         }
 
         if (ctx->verbose) {
-                printf("RECV %x %x %x\n", ev.type, ev.code, ev.value);
+                printf("RECV %x\t%x\t%x\n", ev.type, ev.code, ev.value);
         }
 
         if ((ev.type == EV_SYN) && (ev.code == SYN_REPORT)) {
